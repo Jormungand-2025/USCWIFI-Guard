@@ -362,6 +362,7 @@ class App:
         self.probe_running = False
         self.probe_ok = None
         self.network_epoch = 0
+        self.auth_state = None
         try:
             self.settings, self.credentials = read_settings()
         except Exception:
@@ -436,6 +437,10 @@ class App:
                 return
             self.credentials, self.settings = credentials, settings
             self.next_login, self.failures = 0, 0
+            self.auth_state = None
+            self.network_epoch += 1
+            self.probe_ok = None
+            self.last_internet = 0
         self.password.set('')
         self.pause_text.set('暂停维护')
         self.update('配置已保存，开始维护')
@@ -445,6 +450,10 @@ class App:
     def toggle_pause(self):
         with self.lock:
             self.settings['paused'] = False if self.settings.get('blocked') else not self.settings.get('paused', False)
+            self.network_epoch += 1
+            self.auth_state = None
+            self.probe_ok = None
+            self.last_internet = 0
             if not self.settings['paused']:
                 self.settings['blocked'] = ''
                 self.next_login, self.failures = 0, 0
@@ -460,10 +469,11 @@ class App:
         webbrowser.open(login_page_url())
 
     def update(self, text):
-        if text != self.status:
-            self.status = text
-            logging.info(text)
-            self.events.put(('status', text))
+        with self.lock:
+            if text != self.status:
+                self.status = text
+                logging.info(text)
+                self.events.put(('status', text))
 
     def permitted(self):
         with self.lock:
@@ -505,6 +515,7 @@ class App:
                             self.last_internet = 0
                             self.probe_ok = None
                             self.network_epoch += 1
+                            self.auth_state = None
                             self.last_action = action
                         if action == 'other':
                             self.update('正在使用其他网络，校园网维护待命')
@@ -539,41 +550,64 @@ class App:
                 wlan.close()
 
     def maintain(self, wlan, credentials):
+        with self.lock:
+            request_epoch = self.network_epoch
         portal = Portal()
         try:
             online = portal.logged_in()
-            if online:
-                self.failures = 0
-                if self.probe_ok is True:
-                    self.update('USCWIFI 已登录，Internet 可用')
-                elif self.probe_ok is False:
-                    self.update('校园网已登录，等待 Internet 恢复')
-                else:
-                    self.update('校园网已登录，正在后台确认 Internet')
-                interval = 60 if self.probe_ok else 10
-                if not self.probe_running and time.monotonic() - self.last_internet >= interval:
-                    self.probe_running = True
-                    self.last_internet = time.monotonic()
-                    threading.Thread(target=self.probe_internet, args=(self.network_epoch,), daemon=True).start()
-                return
-            if time.monotonic() < self.next_login:
-                self.update('等待认证结果或网络恢复，稍后重试')
-                return
-            self.update('正在进行校园网认证')
+            with self.lock:
+                if not self.permitted() or request_epoch != self.network_epoch:
+                    return
+                self.record_auth(online)
+                request_epoch = self.network_epoch
+                if online:
+                    self.failures = 0
+                    if self.probe_ok is True:
+                        self.update('USCWIFI 已登录，Internet 可用')
+                    elif self.probe_ok is False:
+                        self.update('校园网已登录，等待 Internet 恢复')
+                    else:
+                        self.update('校园网已登录，正在后台确认 Internet')
+                    interval = 60 if self.probe_ok else 10
+                    if not self.probe_running and time.monotonic() - self.last_internet >= interval:
+                        self.probe_running = True
+                        self.last_internet = time.monotonic()
+                        threading.Thread(target=self.probe_internet, args=(self.network_epoch,), daemon=True).start()
+                    return
+                if time.monotonic() < self.next_login:
+                    self.update('认证接口暂未确认在线，稍后再次查询')
+                    return
+                self.update('正在进行校园网认证')
             if portal.login(credentials, lambda: self.safe_to_submit(wlan, credentials)):
-                self.next_login = time.monotonic() + 8
-                self.next_status = time.monotonic() + 0.5
-                self.last_internet = 0
-                self.update('认证已提交，等待确认联网')
+                with self.lock:
+                    if self.permitted() and request_epoch == self.network_epoch:
+                        self.next_login = time.monotonic() + 8
+                        self.next_status = time.monotonic() + 0.5
+                        self.last_internet = 0
+                        self.update('认证已提交，等待认证接口确认')
         finally:
             portal.close()
+
+    def record_auth(self, online):
+        """An authenticated session must never inherit a prior login cooldown."""
+        previous = self.auth_state
+        if online != previous:
+            self.network_epoch += 1
+            self.probe_ok = None
+            self.last_internet = 0
+            self.auth_state = online
+        if online or previous is True:
+            self.next_login = 0
+        if online:
+            self.failures = 0
 
     def probe_internet(self, epoch):
         try:
             available = internet_available()
-            if epoch == self.network_epoch and self.permitted() and self.last_action == 'campus':
-                self.probe_ok = available
-                self.update('USCWIFI 已登录，Internet 可用' if available else '校园网已登录，等待 Internet 恢复')
+            with self.lock:
+                if epoch == self.network_epoch and self.auth_state is True and self.permitted() and self.last_action == 'campus':
+                    self.probe_ok = available
+                    self.update('USCWIFI 已登录，Internet 可用' if available else '校园网已登录，等待 Internet 恢复')
         finally:
             self.probe_running = False
 
@@ -582,8 +616,10 @@ class App:
             while True:
                 event, value = self.events.get_nowait()
                 if event == 'status':
-                    self.status_text.set(value)
-                    self.tray.title = ('USCWIFI：' + value)[:120]
+                    # Several worker results can arrive before this UI tick.
+                    # Render the latest state instead of replaying old results.
+                    self.status_text.set(self.status)
+                    self.tray.title = ('USCWIFI：' + self.status)[:120]
                     if self.settings.get('blocked'):
                         self.pause_text.set('恢复维护')
                 elif event == 'notice':

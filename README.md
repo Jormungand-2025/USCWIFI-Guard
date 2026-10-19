@@ -52,12 +52,21 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1
 
 生成文件：`dist/USCWIFI_Guard.exe`。本地构建不需要校园网账号密码。
 
+## 回归测试
+
+在 Windows 上安装依赖后运行离线测试，无需真实凭据，也不会断开网络：
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
 ## 项目结构
 
 ```text
 src/campus_guard.py       主程序
 docs/usage.md             使用与故障处理
 scripts/build.ps1         Windows 打包脚本
+tests/                    认证状态和并发结果回归测试
 requirements.txt         运行依赖
 requirements-dev.txt     构建依赖
 CHANGELOG.md             版本记录
