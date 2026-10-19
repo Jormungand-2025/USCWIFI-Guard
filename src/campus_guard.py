@@ -30,8 +30,8 @@ DATA = Path(os.environ['LOCALAPPDATA']) / 'USCWIFI维护助手'
 CONFIG = DATA / 'settings.json'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 APP_NAME = 'USCWIFIGuard'
-APP_VERSION = '1.0.2'
-BUILD_ID = '20261019.3'
+APP_VERSION = '1.0.3'
+BUILD_ID = '20261020.1'
 APP_TITLE = f'USCWIFI 维护助手 v{APP_VERSION}'
 CREATE_NO_WINDOW = 0x08000000
 
@@ -95,14 +95,6 @@ def set_startup(enabled):
                 pass
 
 
-def powershell(script):
-    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
-                            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=20)
-    if result.returncode:
-        raise RuntimeError('系统网络信息暂时不可用')
-    return result.stdout.decode('utf-8-sig').strip()
-
-
 class Guid(C.Structure):
     _fields_ = [('a', W.DWORD), ('b', W.WORD), ('c', W.WORD), ('d', C.c_ubyte * 8)]
 
@@ -158,6 +150,8 @@ class WLAN:
 def action_for(wifi, wired):
     if wired:
         return 'other'
+    if any(state == 1 and not ssid for state, ssid in wifi):
+        return 'wait'
     if any(state == 1 and ssid != SSID for state, ssid in wifi):
         return 'other'
     if any(state == 1 and ssid == SSID for state, ssid in wifi):
@@ -221,26 +215,64 @@ def adapters():
     raise RuntimeError('网络地址正在变化')
 
 
-_hardware = {}
+class IfRow2(C.Structure):
+    """Windows MIB_IF_ROW2, including its complete output buffer."""
+    _fields_ = [
+        ('luid', C.c_ulonglong), ('index', W.ULONG), ('guid', Guid),
+        ('alias', W.WCHAR * 257), ('description', W.WCHAR * 257),
+        ('address_length', W.ULONG), ('address', C.c_ubyte * 32),
+        ('permanent_address', C.c_ubyte * 32), ('mtu', W.ULONG),
+        ('type', W.ULONG), ('tunnel_type', W.ULONG), ('media_type', W.ULONG),
+        ('physical_medium', W.ULONG), ('access_type', W.ULONG),
+        ('direction_type', W.ULONG), ('flags', C.c_ubyte),
+        ('oper_status', W.ULONG), ('admin_status', W.ULONG),
+        ('media_state', W.ULONG), ('network_guid', Guid),
+        ('connection_type', W.ULONG),
+        ('counters', C.c_ulonglong * 20)]
 
 
-def refresh_hardware(stop):
-    # Slow inventory runs off the critical path. Unknown Ethernet is preserved.
-    while not stop.is_set():
-        try:
-            result = json.loads(powershell("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Select-Object ifIndex,HardwareInterface) | ConvertTo-Json -Compress"))
-            if isinstance(result, dict):
-                result = [result]
-            current = {a['ifIndex']: bool(a['HardwareInterface']) for a in result}
-            _hardware.update(current)
-        except Exception:
-            pass
-        stop.wait(30)
+def interface_info(index):
+    row = IfRow2()
+    row.index = index
+    get_entry = C.windll.iphlpapi.GetIfEntry2
+    get_entry.argtypes = [C.POINTER(IfRow2)]
+    get_entry.restype = W.ULONG
+    rc = get_entry(C.byref(row))
+    if rc:
+        raise OSError(rc, '网卡状态正在变化，请稍后重试')
+    return row
+
+
+def connected_physical_ethernet(row):
+    # HardwareInterface=1, FilterInterface=2, NotMediaConnected=16.
+    # Some wireless drivers expose Ethernet type; physical medium disambiguates.
+    return (row.type == 6 and bool(row.flags & 1)
+            and not (row.flags & (2 | 16 | 128))
+            and row.physical_medium not in (1, 9)
+            and row.oper_status == 1 and row.media_state == 1)
+
+
+_last_wired_evidence = None
 
 
 def wired_active():
-    return any(kind == 6 and ips and gateway not in ('', '0.0.0.0')
-               and _hardware.get(index, True) for index, kind, ips, gateway in adapters())
+    global _last_wired_evidence
+    evidence = []
+    active = False
+    for index, kind, ips, gateway in adapters():
+        if kind != 6:
+            continue
+        row = interface_info(index)
+        addressed = bool(ips) and gateway not in ('', '0.0.0.0')
+        selected = addressed and connected_physical_ethernet(row)
+        active = active or selected
+        evidence.append((index, row.type, row.flags, row.physical_medium,
+                         row.oper_status, row.media_state, bool(addressed), bool(selected)))
+    evidence = tuple(sorted(evidence))
+    if evidence != _last_wired_evidence:
+        logging.info('有线判定(index,type,flags,medium,oper,media,addressed,selected)=%s', evidence)
+        _last_wired_evidence = evidence
+    return active
 
 
 def login_page_url():
@@ -424,7 +456,6 @@ class App:
             pystray.MenuItem('打开校园网登录页', lambda *_: self.events.put(('portal', None))),
             pystray.MenuItem('退出', lambda *_: self.events.put(('quit', None)))))
         threading.Thread(target=self.tray.run, daemon=True).start()
-        threading.Thread(target=refresh_hardware, args=(self.stop,), daemon=True).start()
         threading.Thread(target=self.worker, daemon=True).start()
         self.root.after(250, self.pump)
         if not self.credentials or '--background' not in sys.argv:
@@ -583,8 +614,13 @@ class App:
                     elif not credentials:
                         self.update('请先输入账号密码并保存')
                     else:
-                        action = action_for(wlan.snapshot(), wired_active())
+                        wifi = wlan.snapshot()
+                        wired = wired_active()
+                        action = action_for(wifi, wired)
                         if action != self.last_action:
+                            logging.info('网络选择 action=%s wired=%s wifi=%s', action, wired,
+                                         [(state, 'campus' if ssid == SSID else 'other' if ssid else 'unknown')
+                                          for state, ssid in wifi])
                             self.next_status = self.next_login = 0
                             self.last_internet = 0
                             self.probe_ok = None
@@ -592,7 +628,8 @@ class App:
                             self.auth_state = None
                             self.last_action = action
                         if action == 'other':
-                            self.update('正在使用其他网络，校园网维护待命')
+                            self.update('检测到已连接的实体有线网络，校园网维护待命' if wired
+                                        else '检测到其他 Wi-Fi 连接，校园网维护待命')
                         elif action == 'no_adapter':
                             self.update('未发现无线网卡，等待可用')
                         elif action == 'wait':
