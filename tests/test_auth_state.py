@@ -26,6 +26,8 @@ class AuthenticationStateTests(unittest.TestCase):
         app.probe_ok = None
         app.network_epoch = 0
         app.auth_state = None
+        app.unconfirmed_logins = 0
+        app.portal_client = None
         app.last_action = 'campus'
         app.failures = 0
         app.safe_to_submit = lambda *_: True
@@ -62,6 +64,32 @@ class AuthenticationStateTests(unittest.TestCase):
             app.maintain(None, {})
             app.maintain(None, {})
         self.assertEqual(portal.login.call_count, 1)
+
+    def test_status_confirmation_uses_the_login_session(self):
+        app = self.app()
+        portal = MagicMock()
+        portal.logged_in.side_effect = [False, True]
+        portal.login.return_value = True
+        with patch.object(guard, 'Portal', return_value=portal) as factory, patch.object(guard.threading, 'Thread'):
+            app.maintain(None, {})
+            app.maintain(None, {})
+        factory.assert_called_once()
+        portal.close.assert_not_called()
+        self.assertTrue(app.auth_state)
+
+    def test_success_without_confirmation_stops_after_three_submissions(self):
+        app = self.app()
+        portal = MagicMock()
+        portal.logged_in.return_value = False
+        portal.login.return_value = True
+        with patch.object(guard, 'Portal', return_value=portal):
+            for _ in range(3):
+                app.next_login = 0
+                app.maintain(None, {})
+            app.next_login = 0
+            with self.assertRaises(guard.ManualRequired):
+                app.maintain(None, {})
+        self.assertEqual(portal.login.call_count, 3)
 
     def test_late_probe_cannot_overwrite_logged_out_session(self):
         app = self.app()

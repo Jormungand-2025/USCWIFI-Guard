@@ -8,12 +8,13 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import urllib.parse
 import webbrowser
 import winreg
@@ -29,8 +30,8 @@ DATA = Path(os.environ['LOCALAPPDATA']) / 'USCWIFI维护助手'
 CONFIG = DATA / 'settings.json'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 APP_NAME = 'USCWIFIGuard'
-APP_VERSION = '1.0.1'
-BUILD_ID = '20261019.2'
+APP_VERSION = '1.0.2'
+BUILD_ID = '20261019.3'
 APP_TITLE = f'USCWIFI 维护助手 v{APP_VERSION}'
 CREATE_NO_WINDOW = 0x08000000
 
@@ -272,22 +273,61 @@ class ManualRequired(Exception):
     pass
 
 
+def response_summary(result):
+    """Only structured protocol outcomes; no identity, IP, cookie or raw messages."""
+    summary = {}
+    for key in ('code', 'isChangePwd', 'enableDial'):
+        value = result.get(key)
+        if isinstance(value, (int, bool)) or value in ('0', '1'):
+            summary[key] = value
+    for key in ('authCode', 'dialCode', 'userStatus'):
+        value = result.get(key)
+        if isinstance(value, str) and re.fullmatch(r'[a-zA-Z_:.-]{0,80}', value):
+            summary[key] = value
+    message = str(result.get('msg', '')).lower()
+    for label, words in [('password', ('密码', 'password')), ('captcha', ('验证码', 'captcha')),
+                         ('quota', ('欠费', '余额', '流量')), ('device_limit', ('设备', '在线数')),
+                         ('proxy', ('代理', '共享', 'proxy'))]:
+        if any(word in message for word in words):
+            summary['message_category'] = label
+            break
+    return summary
+
+
 class Portal:
     def __init__(self):
         self.s = requests.Session()
         self.s.trust_env = False
+        self.page_url = None
 
     def close(self):
         self.s.close()
 
     def call(self, path, data=None):
-        r = self.s.request('POST' if data is not None else 'GET', BASE + '/api/' + path,
-                           data=data, timeout=(2, 3), allow_redirects=False)
+        try:
+            r = self.s.request('POST' if data is not None else 'GET', BASE + '/api/' + path,
+                               data=data, timeout=(2, 3), allow_redirects=False)
+        except requests.RequestException as exc:
+            logging.info('认证接口 %s 请求异常：%s', path, type(exc).__name__)
+            raise
         r.raise_for_status()
         if r.is_redirect:
             raise RuntimeError('认证接口发生变化')
         # Some server responses omit UTF-8 in the Content-Type header.
-        return json.loads(r.content.decode('utf-8-sig'))
+        result = json.loads(r.content.decode('utf-8-sig'))
+        if path in ('account/check', 'account/login') or (path == 'account/status' and result.get('code') != 0):
+            summary = response_summary(result)
+            if path == 'account/login' and result.get('code') == 0:
+                online = result.get('online')
+                summary['has_online_record'] = isinstance(online, dict) and bool(online)
+                if isinstance(online, dict) and online.get('UserIpv4'):
+                    try:
+                        local_ips = {ip for _, _, ips, _ in adapters() for ip in ips}
+                        summary['returned_ipv4_is_local'] = online['UserIpv4'] in local_ips
+                    except Exception:
+                        pass
+            logging.info('认证接口 %s：%s', path, json.dumps(summary, ensure_ascii=False))
+        return result
 
     def logged_in(self):
         status = self.call('account/status')
@@ -296,34 +336,33 @@ class Portal:
         return status.get('code') == 0
 
     def discover(self, redirect=False):
-        # Read the current captive redirect. Never reuse a previous user's IP.
-        params = {}
-        if redirect:
-            try:
-                r = self.s.get('http://www.msftconnecttest.com/connecttest.txt', timeout=(1, 2))
-                u = urllib.parse.urlsplit(r.url)
-                if u.hostname == '210.43.112.9':
-                    params = dict(urllib.parse.parse_qsl(u.query))
-            except requests.RequestException:
-                pass
-        ips = [ip for _, kind, addresses, _ in adapters() if kind == 71 for ip in addresses]
-        ip = params.get('wlanuserip') or params.get('ip')
-        if ip not in ips:
-            if len(ips) != 1:
-                raise RuntimeError('等待校园网分配明确的 IPv4 地址')
-            ip = ips[0]
-        fields = {'nasId': params.get('nasId', '1'), 'userIpv4': ip, 'isp': 'local'}
-        for key in ('switchip', 'mac'):
+        # Load the page before CSRF/check/login, retaining its cookies like a browser.
+        response = self.s.get(login_page_url(), timeout=(2, 3))
+        response.raise_for_status()
+        parsed = urllib.parse.urlsplit(response.url)
+        if parsed.hostname != '210.43.112.9':
+            raise ManualRequired('认证页面跳转到了其他服务器，请打开登录页检查')
+        self.page_url = response.url
+        self.s.headers.update({'Referer': self.page_url, 'Origin': BASE,
+                               'X-Requested-With': 'XMLHttpRequest'})
+        params = dict(urllib.parse.parse_qsl(parsed.query))
+        fields = {'nasId': params.get('nasId', '1'), 'isp': 'local'}
+        # The school's JavaScript maps ONLY wlanuserip to userIpv4.
+        # Its ordinary "ip" URL parameter is not an explicit login target.
+        for key in ('switchip', 'mac', 'wlanuserip'):
             if params.get(key):
-                fields['userMac' if key == 'mac' else key] = params[key]
+                mapped = {'mac': 'userMac', 'wlanuserip': 'userIpv4'}.get(key, key)
+                fields[mapped] = params[key]
+        logging.info('网页认证上下文：参数字段=%s，会话已建立=%s',
+                     ','.join(sorted(fields)), bool(self.page_url))
         return fields
 
     def login(self, credentials, guard):
+        fields = self.discover()
         token = self.call('csrf-token').get('csrf_token')
         if not token:
             raise RuntimeError('未取得网页登录校验信息')
         self.s.headers['X-CSRF-Token'] = token
-        fields = self.discover()
         fields.update(credentials)
         if not guard():
             return False
@@ -349,7 +388,7 @@ class App:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(APP_TITLE)
-        self.root.geometry('510x460')
+        self.root.geometry('510x490')
         self.root.resizable(False, False)
         self.lock = threading.RLock()
         self.stop = threading.Event()
@@ -366,6 +405,8 @@ class App:
         self.probe_ok = None
         self.network_epoch = 0
         self.auth_state = None
+        self.unconfirmed_logins = 0
+        self.portal_client = None
         try:
             self.settings, self.credentials = read_settings()
         except Exception:
@@ -416,7 +457,10 @@ class App:
         ttk.Button(row, textvariable=self.pause_text, command=self.toggle_pause).pack(side='left', padx=8)
         ttk.Button(row, text='打开登录页', command=self.open_portal).pack(side='left')
         ttk.Button(row, text='隐藏到托盘', command=self.root.withdraw).pack(side='left', padx=8)
-        ttk.Button(f, text='退出程序', command=self.quit).pack(anchor='e', pady=10)
+        bottom = ttk.Frame(f)
+        bottom.pack(fill='x', pady=10)
+        ttk.Button(bottom, text='导出诊断', command=self.export_diagnostics).pack(side='left')
+        ttk.Button(bottom, text='退出程序', command=self.quit).pack(side='right')
         self.root.protocol('WM_DELETE_WINDOW', self.root.withdraw)
 
     def show(self):
@@ -441,6 +485,7 @@ class App:
                 return
             self.credentials, self.settings = credentials, settings
             self.next_login, self.failures = 0, 0
+            self.unconfirmed_logins = 0
             self.auth_state = None
             self.network_epoch += 1
             self.probe_ok = None
@@ -461,6 +506,7 @@ class App:
             if not self.settings['paused']:
                 self.settings['blocked'] = ''
                 self.next_login, self.failures = 0, 0
+                self.unconfirmed_logins = 0
             try:
                 write_settings(self.settings, self.credentials)
             except Exception:
@@ -471,6 +517,30 @@ class App:
 
     def open_portal(self):
         webbrowser.open(login_page_url())
+
+    def export_diagnostics(self):
+        path = filedialog.asksaveasfilename(parent=self.root, title='保存脱敏诊断',
+                 defaultextension='.txt', initialfile=f'USCWIFI-diagnostics-{APP_VERSION}.txt',
+                 filetypes=[('文本文件', '*.txt')])
+        if not path:
+            return
+        try:
+            sections = [f'{APP_TITLE}\n构建 {BUILD_ID}\n当前状态：{self.status}\n']
+            for file in (DATA / 'status.log.1', DATA / 'status.log'):
+                if file.exists():
+                    lines = file.read_text(encoding='utf-8', errors='replace').splitlines()[-200:]
+                    sections.append('\n'.join(lines))
+            text = '\n\n'.join(sections)
+            with self.lock:
+                for value in (self.credentials or {}).values():
+                    if value:
+                        text = text.replace(value, '[已脱敏]')
+            text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '[IP已脱敏]', text)
+            text = re.sub(r'\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b', '[MAC已脱敏]', text)
+            Path(path).write_text(text, encoding='utf-8')
+            messagebox.showinfo(APP_TITLE, '诊断已导出，不包含保存的账号密码或配置文件。', parent=self.root)
+        except Exception:
+            messagebox.showerror(APP_TITLE, '诊断导出失败，请尝试其他保存位置。', parent=self.root)
 
     def update(self, text):
         with self.lock:
@@ -552,11 +622,15 @@ class App:
         finally:
             if wlan:
                 wlan.close()
+            if self.portal_client:
+                self.portal_client.close()
 
     def maintain(self, wlan, credentials):
         with self.lock:
             request_epoch = self.network_epoch
-        portal = Portal()
+        portal = getattr(self, 'portal_client', None)
+        if portal is None:
+            portal = self.portal_client = Portal()
         try:
             online = portal.logged_in()
             with self.lock:
@@ -581,6 +655,8 @@ class App:
                 if time.monotonic() < self.next_login:
                     self.update('认证接口暂未确认在线，稍后再次查询')
                     return
+                if self.unconfirmed_logins >= 3:
+                    raise ManualRequired('连续提交认证后，服务器仍未确认本机在线；请导出诊断，或打开网页手动处理')
                 self.update('正在进行校园网认证')
             if portal.login(credentials, lambda: self.safe_to_submit(wlan, credentials)):
                 with self.lock:
@@ -588,9 +664,12 @@ class App:
                         self.next_login = time.monotonic() + 8
                         self.next_status = time.monotonic() + 0.5
                         self.last_internet = 0
+                        self.unconfirmed_logins += 1
                         self.update('认证已提交，等待认证接口确认')
         finally:
-            portal.close()
+            if self.stop.is_set():
+                portal.close()
+                self.portal_client = None
 
     def record_auth(self, online):
         """An authenticated session must never inherit a prior login cooldown."""
@@ -604,6 +683,7 @@ class App:
             self.next_login = 0
         if online:
             self.failures = 0
+            self.unconfirmed_logins = 0
 
     def probe_internet(self, epoch):
         try:
