@@ -29,6 +29,9 @@ DATA = Path(os.environ['LOCALAPPDATA']) / 'USCWIFI维护助手'
 CONFIG = DATA / 'settings.json'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 APP_NAME = 'USCWIFIGuard'
+APP_VERSION = '1.0.1'
+BUILD_ID = '20261019.2'
+APP_TITLE = f'USCWIFI 维护助手 v{APP_VERSION}'
 CREATE_NO_WINDOW = 0x08000000
 
 
@@ -345,8 +348,8 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title('USCWIFI 维护助手')
-        self.root.geometry('510x440')
+        self.root.title(APP_TITLE)
+        self.root.geometry('510x460')
         self.root.resizable(False, False)
         self.lock = threading.RLock()
         self.stop = threading.Event()
@@ -374,7 +377,7 @@ class App:
         self.status_text = tk.StringVar(value=self.status)
         self.pause_text = tk.StringVar(value='恢复维护' if self.settings.get('paused') else '暂停维护')
         self.build_ui()
-        self.tray = pystray.Icon(APP_NAME, self.icon_image(), 'USCWIFI 维护助手', pystray.Menu(
+        self.tray = pystray.Icon(APP_NAME, self.icon_image(), APP_TITLE, pystray.Menu(
             pystray.MenuItem('状态与账号设置', lambda *_: self.events.put(('show', None)), default=True),
             pystray.MenuItem('暂停 / 恢复维护', lambda *_: self.events.put(('pause', None))),
             pystray.MenuItem('打开校园网登录页', lambda *_: self.events.put(('portal', None))),
@@ -398,7 +401,8 @@ class App:
     def build_ui(self):
         f = ttk.Frame(self.root, padding=22)
         f.pack(fill='both', expand=True)
-        ttk.Label(f, text='USCWIFI 维护助手', font=('Microsoft YaHei UI', 17, 'bold')).pack(anchor='w')
+        ttk.Label(f, text=APP_TITLE, font=('Microsoft YaHei UI', 17, 'bold')).pack(anchor='w')
+        ttk.Label(f, text=f'构建 {BUILD_ID}').pack(anchor='w', pady=(3, 0))
         ttk.Label(f, textvariable=self.status_text, wraplength=455).pack(anchor='w', pady=(12, 16))
         ttk.Label(f, text='校园网账号').pack(anchor='w')
         ttk.Entry(f, textvariable=self.username, width=53).pack(fill='x', pady=(4, 10))
@@ -619,7 +623,7 @@ class App:
                     # Several worker results can arrive before this UI tick.
                     # Render the latest state instead of replaying old results.
                     self.status_text.set(self.status)
-                    self.tray.title = ('USCWIFI：' + self.status)[:120]
+                    self.tray.title = (APP_TITLE + '：' + self.status)[:120]
                     if self.settings.get('blocked'):
                         self.pause_text.set('恢复维护')
                 elif event == 'notice':
@@ -659,6 +663,7 @@ def main():
     DATA.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(DATA / 'status.log', maxBytes=256000, backupCount=2, encoding='utf-8')
     logging.basicConfig(level=logging.INFO, handlers=[handler], format='%(asctime)s %(message)s')
+    logging.info('%s，构建 %s', APP_TITLE, BUILD_ID)
     try:
         App().run()
     finally:

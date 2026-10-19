@@ -8,6 +8,8 @@ Windows 托盘程序，用于自动连接 `USCWIFI`、完成校园网账号认�
 
 从 [Releases](https://github.com/Jormungand-2025/USCWIFI-Guard/releases/latest) 下载 `USCWIFI_Guard.exe`。无需安装 Python。
 
+当前 `v1.0.1` 重新构建号为 `20261019.2`。启动后窗口标题和主界面应显示 `v1.0.1`，主界面同时显示构建号。若仍看不到版本号，请先从托盘退出旧进程，再运行新下载的程序。
+
 1. 先在 Windows 中手动连接一次 `USCWIFI`，确保系统已保存同名无线配置，并保持 Wi-Fi 开启。
 2. 将程序放到固定位置，双击运行，在本机窗口输入账号和密码。
 3. 按需勾选“登录 Windows 后自动启动”，点击“保存并开始”。
