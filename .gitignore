@@ -1,0 +1,23 @@
+# Python / development
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+.pytest_cache/
+
+# Build outputs (binaries belong in Releases)
+build/
+dist/
+*.spec
+*.exe
+
+# Local credentials and diagnostics
+.env
+.env.*
+settings.json
+*.log
+*.log.*
+*.tmp
+work/
