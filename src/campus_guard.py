@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -30,8 +31,8 @@ DATA = Path(os.environ['LOCALAPPDATA']) / 'USCWIFI维护助手'
 CONFIG = DATA / 'settings.json'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 APP_NAME = 'USCWIFIGuard'
-APP_VERSION = '1.0.3'
-BUILD_ID = '20261020.1'
+APP_VERSION = '1.0.4'
+BUILD_ID = '20261020.2'
 APP_TITLE = f'USCWIFI 维护助手 v{APP_VERSION}'
 CREATE_NO_WINDOW = 0x08000000
 
@@ -255,30 +256,53 @@ def connected_physical_ethernet(row):
 _last_wired_evidence = None
 
 
-def wired_active():
+def wired_connections():
     global _last_wired_evidence
     evidence = []
-    active = False
+    connections = []
     for index, kind, ips, gateway in adapters():
         if kind != 6:
             continue
         row = interface_info(index)
         addressed = bool(ips) and gateway not in ('', '0.0.0.0')
         selected = addressed and connected_physical_ethernet(row)
-        active = active or selected
+        if selected:
+            connections.append((index, ips[0], gateway))
         evidence.append((index, row.type, row.flags, row.physical_medium,
                          row.oper_status, row.media_state, bool(addressed), bool(selected)))
     evidence = tuple(sorted(evidence))
     if evidence != _last_wired_evidence:
         logging.info('有线判定(index,type,flags,medium,oper,media,addressed,selected)=%s', evidence)
         _last_wired_evidence = evidence
-    return active
+    return tuple(sorted(connections))
+
+
+def wired_active():
+    return bool(wired_connections())
+
+
+def portal_routes_through(index):
+    destination = W.DWORD(int.from_bytes(socket.inet_aton('210.43.112.9'), 'little'))
+    best = W.DWORD()
+    rc = C.windll.iphlpapi.GetBestInterface(destination, C.byref(best))
+    return rc == 0 and best.value == index
+
+
+class SourceAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, source_ip):
+        self.source_ip = source_ip
+        super().__init__()
+
+    def init_poolmanager(self, connections, maxsize, block=False, **kwargs):
+        kwargs['source_address'] = (self.source_ip, 0)
+        return super().init_poolmanager(connections, maxsize, block=block, **kwargs)
 
 
 def login_page_url():
     params = {'nasId': '1'}
     try:
-        ips = {ip for _, kind, addresses, _ in adapters() if kind == 71 for ip in addresses}
+        wired = wired_connections()
+        ips = {ip for _, ip, _ in wired} if wired else {ip for _, kind, addresses, _ in adapters() if kind == 71 for ip in addresses}
         if len(ips) == 1:
             params['ip'] = ips.pop()
     except Exception:
@@ -286,13 +310,15 @@ def login_page_url():
     return PORTAL + '?' + urllib.parse.urlencode(params)
 
 
-def internet_available():
+def internet_available(source_ip=None):
     # Verify exact content over HTTPS: portal HTML cannot masquerade as internet.
     for url, expected in [('https://www.msftconnecttest.com/connecttest.txt', 'Microsoft Connect Test'),
                           ('https://connectivitycheck.gstatic.com/generate_204', None)]:
         try:
             with requests.Session() as s:
                 s.trust_env = False
+                if source_ip:
+                    s.mount('https://', SourceAdapter(source_ip))
                 r = s.get(url, timeout=(3, 4), allow_redirects=False)
                 if (expected and r.status_code == 200 and r.text.strip() == expected) or (expected is None and r.status_code == 204):
                     return True
@@ -327,10 +353,29 @@ def response_summary(result):
 
 
 class Portal:
-    def __init__(self):
+    def __init__(self, source_ip=None):
         self.s = requests.Session()
         self.s.trust_env = False
         self.page_url = None
+        self.entry_url = None
+        if source_ip:
+            self.s.mount('http://', SourceAdapter(source_ip))
+            self.s.mount('https://', SourceAdapter(source_ip))
+
+    def detect_wired_campus(self):
+        # No credentials during discovery. Require a redirect to the known portal.
+        response = self.s.get('http://www.msftconnecttest.com/connecttest.txt',
+                              timeout=(2, 3), allow_redirects=False)
+        if not response.is_redirect:
+            return False
+        target = urllib.parse.urljoin(response.url, response.headers.get('Location', ''))
+        parsed = urllib.parse.urlsplit(target)
+        if (parsed.scheme != 'http' or parsed.hostname != '210.43.112.9'
+                or parsed.port not in (None, 80) or parsed.username or parsed.password
+                or parsed.path != '/tpl/default/login_account.html'):
+            return False
+        self.entry_url = target
+        return True
 
     def close(self):
         self.s.close()
@@ -369,7 +414,7 @@ class Portal:
 
     def discover(self, redirect=False):
         # Load the page before CSRF/check/login, retaining its cookies like a browser.
-        response = self.s.get(login_page_url(), timeout=(2, 3))
+        response = self.s.get(self.entry_url or login_page_url(), timeout=(2, 3))
         response.raise_for_status()
         parsed = urllib.parse.urlsplit(response.url)
         if parsed.hostname != '210.43.112.9':
@@ -439,6 +484,8 @@ class App:
         self.auth_state = None
         self.unconfirmed_logins = 0
         self.portal_client = None
+        self.wired_key = None
+        self.wired_confirmed = False
         try:
             self.settings, self.credentials = read_settings()
         except Exception:
@@ -481,7 +528,7 @@ class App:
         ttk.Label(f, text='密码（已保存时可留空，保留原密码）').pack(anchor='w')
         ttk.Entry(f, textvariable=self.password, show='●', width=53).pack(fill='x', pady=(4, 10))
         ttk.Checkbutton(f, text='登录 Windows 后自动启动', variable=self.startup).pack(anchor='w')
-        ttk.Label(f, text='账号密码通过 Windows 加密保存在当前用户本机。\n只维护 USCWIFI；保留其他 Wi-Fi 和有线网络。', wraplength=455).pack(anchor='w', pady=12)
+        ttk.Label(f, text='账号密码通过 Windows 加密保存在当前用户本机。\n支持 USCWIFI 和有线校园网；普通网络保持不动。', wraplength=455).pack(anchor='w', pady=12)
         row = ttk.Frame(f)
         row.pack(fill='x', pady=4)
         ttk.Button(row, text='保存并开始', command=self.save).pack(side='left')
@@ -587,7 +634,12 @@ class App:
     def safe_to_submit(self, wlan, credentials):
         with self.lock:
             same_credentials = self.credentials == credentials
-        return same_credentials and self.permitted() and action_for(wlan.snapshot(), wired_active()) == 'campus'
+        if not same_credentials or not self.permitted():
+            return False
+        if self.last_action == 'wired':
+            return (self.wired_confirmed and wired_connections() == (self.wired_key,)
+                    and portal_routes_through(self.wired_key[0]))
+        return wlan is not None and action_for(wlan.snapshot(), wired_active()) == 'campus'
 
     def block(self, reason):
         with self.lock:
@@ -602,7 +654,10 @@ class App:
     def worker(self):
         wlan = None
         try:
-            wlan = WLAN()
+            try:
+                wlan = WLAN()
+            except OSError:
+                logging.info('无线服务不可用，继续检查有线校园网')
             while not self.stop.is_set():
                 try:
                     with self.lock:
@@ -614,10 +669,22 @@ class App:
                     elif not credentials:
                         self.update('请先输入账号密码并保存')
                     else:
-                        wifi = wlan.snapshot()
-                        wired = wired_active()
-                        action = action_for(wifi, wired)
-                        if action != self.last_action:
+                        connections = wired_connections()
+                        if wlan is None:
+                            try:
+                                wlan = WLAN()
+                            except OSError:
+                                pass
+                        try:
+                            wifi = wlan.snapshot() if wlan else []
+                        except OSError:
+                            if not connections:
+                                raise
+                            wifi = []
+                        wired = bool(connections)
+                        action = 'wired' if wired else action_for(wifi, False)
+                        key = connections[0] if len(connections) == 1 else None
+                        if action != self.last_action or key != self.wired_key:
                             logging.info('网络选择 action=%s wired=%s wifi=%s', action, wired,
                                          [(state, 'campus' if ssid == SSID else 'other' if ssid else 'unknown')
                                           for state, ssid in wifi])
@@ -627,7 +694,17 @@ class App:
                             self.network_epoch += 1
                             self.auth_state = None
                             self.last_action = action
-                        if action == 'other':
+                            self.wired_key = key
+                            self.wired_confirmed = False
+                            self.unconfirmed_logins = 0
+                            if self.portal_client:
+                                self.portal_client.close()
+                                self.portal_client = None
+                        if action == 'wired':
+                            if time.monotonic() >= self.next_status:
+                                self.next_status = time.monotonic() + 10
+                                self.maintain_wired(credentials)
+                        elif action == 'other':
                             self.update('检测到已连接的实体有线网络，校园网维护待命' if wired
                                         else '检测到其他 Wi-Fi 连接，校园网维护待命')
                         elif action == 'no_adapter':
@@ -662,6 +739,28 @@ class App:
             if self.portal_client:
                 self.portal_client.close()
 
+    def maintain_wired(self, credentials):
+        key = self.wired_key
+        if key is None:
+            self.update('检测到多条有线连接，请保留一条后重试')
+            return
+        if not portal_routes_through(key[0]):
+            self.update('有线网络待命：校园认证路径尚未指向此网卡')
+            return
+        if self.portal_client is None:
+            self.portal_client = Portal(source_ip=key[1])
+        if not self.wired_confirmed:
+            self.update('正在识别有线校园网')
+            if not self.portal_client.detect_wired_campus():
+                self.update('未发现有线校园网认证跳转，保持当前网络')
+                return
+            if wired_connections() != (key,) or not self.permitted():
+                return
+            self.wired_confirmed = True
+            logging.info('已识别有线校园网认证跳转')
+        self.next_status = time.monotonic() + 3
+        self.maintain(None, credentials)
+
     def maintain(self, wlan, credentials):
         with self.lock:
             request_epoch = self.network_epoch
@@ -678,7 +777,7 @@ class App:
                 if online:
                     self.failures = 0
                     if self.probe_ok is True:
-                        self.update('USCWIFI 已登录，Internet 可用')
+                        self.update('校园网已登录，Internet 可用')
                     elif self.probe_ok is False:
                         self.update('校园网已登录，等待 Internet 恢复')
                     else:
@@ -724,11 +823,13 @@ class App:
 
     def probe_internet(self, epoch):
         try:
-            available = internet_available()
             with self.lock:
-                if epoch == self.network_epoch and self.auth_state is True and self.permitted() and self.last_action == 'campus':
+                key = self.wired_key if self.last_action == 'wired' else None
+            available = internet_available(key[1]) if key else internet_available()
+            with self.lock:
+                if epoch == self.network_epoch and self.auth_state is True and self.permitted() and self.last_action in ('campus', 'wired'):
                     self.probe_ok = available
-                    self.update('USCWIFI 已登录，Internet 可用' if available else '校园网已登录，等待 Internet 恢复')
+                    self.update('校园网已登录，Internet 可用' if available else '校园网已登录，等待 Internet 恢复')
         finally:
             self.probe_running = False
 
