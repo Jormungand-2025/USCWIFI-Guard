@@ -21,7 +21,7 @@ import webbrowser
 import winreg
 
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 import pystray
 
 BASE = 'http://210.43.112.9'
@@ -31,8 +31,8 @@ DATA = Path(os.environ['LOCALAPPDATA']) / 'USCWIFI维护助手'
 CONFIG = DATA / 'settings.json'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 APP_NAME = 'USCWIFIGuard'
-APP_VERSION = '1.0.4'
-BUILD_ID = '20261020.2'
+APP_VERSION = '1.0.5'
+BUILD_ID = '20261020.3'
 APP_TITLE = f'USCWIFI 维护助手 v{APP_VERSION}'
 CREATE_NO_WINDOW = 0x08000000
 
@@ -465,6 +465,9 @@ class App:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(APP_TITLE)
+        self.window_icons = [ImageTk.PhotoImage(self.icon_image().resize((size, size), Image.Resampling.LANCZOS),
+                                               master=self.root) for size in (16, 32, 48, 64)]
+        self.root.iconphoto(True, *self.window_icons)
         self.root.geometry('510x490')
         self.root.resizable(False, False)
         self.lock = threading.RLock()
@@ -871,6 +874,8 @@ class App:
 
 
 def main():
+    # Group taskbar windows as this app instead of Python or the packager.
+    C.windll.shell32.SetCurrentProcessExplicitAppUserModelID('USCWIFI.Guard')
     # One instance per logged-in Windows session.
     kernel = C.windll.kernel32
     kernel.CreateMutexW.restype = W.HANDLE
