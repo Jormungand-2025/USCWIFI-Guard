@@ -23,22 +23,22 @@ class NetworkPolicyTests(unittest.TestCase):
             return guard.action_for([(1, 'USCWIFI')], guard.wired_active())
 
     def test_virtual_adapter_with_ip_and_gateway_does_not_block_campus(self):
-        self.assertEqual(self.action(self.row(flags=0)), 'campus')
+        self.assertEqual(self.action(self.row(flags=0)), 'wireless')
 
     def test_disconnected_ethernet_with_retained_address_does_not_block(self):
-        self.assertEqual(self.action(self.row(oper=2, media=2)), 'campus')
-        self.assertEqual(self.action(self.row(flags=21)), 'campus')
+        self.assertEqual(self.action(self.row(oper=2, media=2)), 'wireless')
+        self.assertEqual(self.action(self.row(flags=21)), 'wireless')
 
     def test_wireless_driver_reporting_ethernet_type_does_not_block(self):
         for medium in (1, 9):
-            self.assertEqual(self.action(self.row(medium=medium)), 'campus')
+            self.assertEqual(self.action(self.row(medium=medium)), 'wireless')
 
     def test_actual_connected_ethernet_is_preserved(self):
         self.assertEqual(self.action(self.row()), 'other')
 
     def test_physical_interface_without_address_or_gateway_does_not_block(self):
-        self.assertEqual(self.action(self.row(), ips=[]), 'campus')
-        self.assertEqual(self.action(self.row(), gateway='0.0.0.0'), 'campus')
+        self.assertEqual(self.action(self.row(), ips=[]), 'wireless')
+        self.assertEqual(self.action(self.row(), gateway='0.0.0.0'), 'wireless')
 
     def test_no_stale_interface_classification_after_index_reuse(self):
         with patch.object(guard, 'adapters', return_value=[(7, 6, ['192.0.2.2'], '192.0.2.1')]), \
@@ -52,10 +52,17 @@ class NetworkPolicyTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 guard.wired_active()
 
-    def test_other_wifi_is_preserved_and_unknown_ssid_waits(self):
-        self.assertEqual(guard.action_for([(1, 'hotspot')], False), 'other')
-        self.assertEqual(guard.action_for([(1, 'USCWIFI'), (1, 'hotspot')], False), 'other')
-        self.assertEqual(guard.action_for([(1, None)], False), 'wait')
+    def test_connected_wifi_uses_api_regardless_of_ssid(self):
+        self.assertEqual(guard.action_for([(1, 'hotspot')], False), 'wireless')
+        self.assertEqual(guard.action_for([(1, 'USCWIFI'), (1, 'hotspot')], False), 'wireless')
+        self.assertEqual(guard.action_for([(1, None)], False), 'wireless')
+
+    def test_virtual_wireless_adapter_does_not_block_real_wifi(self):
+        rows = [(7, 71, ['192.0.2.2'], '192.0.2.1'),
+                (8, 71, ['192.0.2.3'], '192.0.2.1')]
+        with patch.object(guard, 'adapters', return_value=rows), \
+             patch.object(guard, 'interface_info', side_effect=[self.row(medium=9), self.row(flags=0, medium=9)]):
+            self.assertEqual(guard.wireless_connections(), ((7, '192.0.2.2', '192.0.2.1'),))
 
     def test_windows_abi_complete_output_buffer(self):
         self.assertEqual(ctypes.sizeof(guard.IfRow2), 1352)

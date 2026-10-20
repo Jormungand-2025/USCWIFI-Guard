@@ -6,9 +6,9 @@ Windows 托盘程序，用于自动连接 `USCWIFI`、完成无线或有线校�
 
 ## 下载与使用
 
-从 [Releases](https://github.com/Jormungand-2025/USCWIFI-Guard/releases/latest) 下载 `USCWIFI_Guard.exe`。无需安装 Python。
+从 [Releases](https://github.com/Jormungand-2025/USCWIFI-Guard/releases/latest) 下载 `USCWIFI_Guard_v1.0.6.exe`。无需安装 Python。
 
-当前版本为 `v1.0.5`，构建号为 `20261020.3`。启动后窗口标题和主界面应显示 `v1.0.5`，主界面同时显示构建号。更新时请先从托盘退出旧进程，再运行新下载的程序。
+当前版本为 `v1.0.6`，构建号为 `20261020.5`。启动后窗口标题和主界面应显示 `v1.0.6`，主界面同时显示构建号。更新时请先从托盘退出旧进程，再运行新下载的程序。
 
 1. 先在 Windows 中手动连接一次 `USCWIFI`，确保系统已保存同名无线配置，并保持 Wi-Fi 开启。
 2. 将程序放到固定位置，双击运行，在本机窗口输入账号和密码。
@@ -23,7 +23,7 @@ Windows 托盘程序，用于自动连接 `USCWIFI`、完成无线或有线校�
 - 查询认证状态，未登录时按校园网页现有流程提交认证。
 - 约每 0.5 秒检查无线状态，约每 3 秒查询认证状态；外网探测在后台执行。
 - 使用当前无线 IPv4，直接打开学校账号认证页。
-- 保留其他 Wi-Fi；有线网络识别到学校认证跳转后自动认证，普通有线网络待命。
+- 有线与已连接无线统一查询学校状态 API，不依赖 Wi-Fi 名称或认证页跳转；code=0 确认已登录，code=1 确认校园网未登录并进行认证。
 - 有线认证复用已保存的校园账号密码，绑定有线 IPv4 并检查认证路由；不依赖无线网卡或 WLAN 服务。有线、无线同时连接时优先检查有线。
 - 通过 Windows 原生接口实时判断实体有线连接，排除虚拟网卡和断开连接的旧地址；待命提示区分有线与其他 Wi-Fi。
 - 支持暂停、恢复、修改凭据、退出及当前用户登录后自动启动。
@@ -33,7 +33,7 @@ Windows 托盘程序，用于自动连接 `USCWIFI`、完成无线或有线校�
 
 ## 凭据与日志
 
-有线识别要求 HTTP 探测跳转到 `http://210.43.112.9/tpl/default/login_account.html`。其他跳转形式暂不自动认证；同时存在多条实体有线连接或认证路径经其他网卡时等待处理。有线功能已通过模拟测试，尚待校园有线环境实测。
+识别接口为 `http://210.43.112.9/api/account/status`，请求绑定当前连接的 IPv4 并检查路由。接口不可达、HTTP 错误、跳转或未知 JSON 格式时保持当前网络，约 10 秒后重试，不提交凭据。无法访问既可能是其他网络，也可能是校园认证服务暂时故障。多个同类连接或认证路径经其他网卡时等待处理。有线、无线同时连接时仍优先检查有线。
 
 凭据通过 Windows DPAPI 加密，保存在当前 Windows 用户的 `%LOCALAPPDATA%\USCWIFI维护助手\settings.json`，不包含在仓库和发布文件中。
 
@@ -57,7 +57,7 @@ python -m pip install -r requirements-dev.txt
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1
 ```
 
-生成文件：`dist/USCWIFI_Guard.exe`。本地构建不需要校园网账号密码。
+生成文件：`dist/USCWIFI_Guard_v1.0.6.exe`。本地构建不需要校园网账号密码。
 
 ## 回归测试
 

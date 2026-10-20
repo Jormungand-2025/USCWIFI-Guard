@@ -31,8 +31,8 @@ DATA = Path(os.environ['LOCALAPPDATA']) / 'USCWIFI维护助手'
 CONFIG = DATA / 'settings.json'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 APP_NAME = 'USCWIFIGuard'
-APP_VERSION = '1.0.5'
-BUILD_ID = '20261020.3'
+APP_VERSION = '1.0.6'
+BUILD_ID = '20261020.5'
 APP_TITLE = f'USCWIFI 维护助手 v{APP_VERSION}'
 CREATE_NO_WINDOW = 0x08000000
 
@@ -151,12 +151,8 @@ class WLAN:
 def action_for(wifi, wired):
     if wired:
         return 'other'
-    if any(state == 1 and not ssid for state, ssid in wifi):
-        return 'wait'
-    if any(state == 1 and ssid != SSID for state, ssid in wifi):
-        return 'other'
-    if any(state == 1 and ssid == SSID for state, ssid in wifi):
-        return 'campus'
+    if any(state == 1 for state, _ in wifi):
+        return 'wireless'
     if not wifi:
         return 'no_adapter'
     if any(state not in (0, 4) for state, _ in wifi):
@@ -277,6 +273,18 @@ def wired_connections():
     return tuple(sorted(connections))
 
 
+def wireless_connections():
+    connections = []
+    for index, kind, ips, gateway in adapters():
+        if kind != 71 or not ips:
+            continue
+        row = interface_info(index)
+        if (row.flags & 1 and not row.flags & (2 | 16 | 128)
+                and row.oper_status == 1 and row.media_state == 1):
+            connections.append((index, ips[0], gateway))
+    return tuple(sorted(connections))
+
+
 def wired_active():
     return bool(wired_connections())
 
@@ -331,6 +339,10 @@ class ManualRequired(Exception):
     pass
 
 
+class CampusStatusUnavailable(RuntimeError):
+    pass
+
+
 def response_summary(result):
     """Only structured protocol outcomes; no identity, IP, cookie or raw messages."""
     summary = {}
@@ -362,21 +374,6 @@ class Portal:
             self.s.mount('http://', SourceAdapter(source_ip))
             self.s.mount('https://', SourceAdapter(source_ip))
 
-    def detect_wired_campus(self):
-        # No credentials during discovery. Require a redirect to the known portal.
-        response = self.s.get('http://www.msftconnecttest.com/connecttest.txt',
-                              timeout=(2, 3), allow_redirects=False)
-        if not response.is_redirect:
-            return False
-        target = urllib.parse.urljoin(response.url, response.headers.get('Location', ''))
-        parsed = urllib.parse.urlsplit(target)
-        if (parsed.scheme != 'http' or parsed.hostname != '210.43.112.9'
-                or parsed.port not in (None, 80) or parsed.username or parsed.password
-                or parsed.path != '/tpl/default/login_account.html'):
-            return False
-        self.entry_url = target
-        return True
-
     def close(self):
         self.s.close()
 
@@ -392,6 +389,8 @@ class Portal:
             raise RuntimeError('认证接口发生变化')
         # Some server responses omit UTF-8 in the Content-Type header.
         result = json.loads(r.content.decode('utf-8-sig'))
+        if not isinstance(result, dict):
+            raise RuntimeError('认证接口返回格式无法识别')
         if path in ('account/check', 'account/login') or (path == 'account/status' and result.get('code') != 0):
             summary = response_summary(result)
             if path == 'account/login' and result.get('code') == 0:
@@ -408,7 +407,7 @@ class Portal:
 
     def logged_in(self):
         status = self.call('account/status')
-        if status.get('code') not in (0, 1):
+        if type(status.get('code')) is not int or status['code'] not in (0, 1):
             raise RuntimeError('无法识别认证状态')
         return status.get('code') == 0
 
@@ -487,8 +486,9 @@ class App:
         self.auth_state = None
         self.unconfirmed_logins = 0
         self.portal_client = None
-        self.wired_key = None
-        self.wired_confirmed = False
+        self.network_key = None
+        self.network_wifi = ()
+        self.campus_confirmed = False
         try:
             self.settings, self.credentials = read_settings()
         except Exception:
@@ -639,10 +639,17 @@ class App:
             same_credentials = self.credentials == credentials
         if not same_credentials or not self.permitted():
             return False
+        return self.campus_confirmed and self.connection_matches(wlan)
+
+    def connection_matches(self, wlan):
+        key = self.network_key
+        if key is None or not portal_routes_through(key[0]):
+            return False
         if self.last_action == 'wired':
-            return (self.wired_confirmed and wired_connections() == (self.wired_key,)
-                    and portal_routes_through(self.wired_key[0]))
-        return wlan is not None and action_for(wlan.snapshot(), wired_active()) == 'campus'
+            return wired_connections() == (key,)
+        return (self.last_action == 'wireless' and wlan is not None
+                and not wired_connections() and wireless_connections() == (key,)
+                and tuple(wlan.snapshot()) == self.network_wifi)
 
     def block(self, reason):
         with self.lock:
@@ -686,8 +693,12 @@ class App:
                             wifi = []
                         wired = bool(connections)
                         action = 'wired' if wired else action_for(wifi, False)
+                        if action == 'wireless':
+                            connections = wireless_connections()
                         key = connections[0] if len(connections) == 1 else None
-                        if action != self.last_action or key != self.wired_key:
+                        wifi_identity = tuple(wifi) if action == 'wireless' else ()
+                        if (action != self.last_action or key != self.network_key
+                                or wifi_identity != self.network_wifi):
                             logging.info('网络选择 action=%s wired=%s wifi=%s', action, wired,
                                          [(state, 'campus' if ssid == SSID else 'other' if ssid else 'unknown')
                                           for state, ssid in wifi])
@@ -697,16 +708,17 @@ class App:
                             self.network_epoch += 1
                             self.auth_state = None
                             self.last_action = action
-                            self.wired_key = key
-                            self.wired_confirmed = False
+                            self.network_key = key
+                            self.network_wifi = wifi_identity
+                            self.campus_confirmed = False
                             self.unconfirmed_logins = 0
                             if self.portal_client:
                                 self.portal_client.close()
                                 self.portal_client = None
-                        if action == 'wired':
+                        if action in ('wired', 'wireless'):
                             if time.monotonic() >= self.next_status:
                                 self.next_status = time.monotonic() + 10
-                                self.maintain_wired(credentials)
+                                self.maintain_connected(wlan, credentials)
                         elif action == 'other':
                             self.update('检测到已连接的实体有线网络，校园网维护待命' if wired
                                         else '检测到其他 Wi-Fi 连接，校园网维护待命')
@@ -742,27 +754,28 @@ class App:
             if self.portal_client:
                 self.portal_client.close()
 
-    def maintain_wired(self, credentials):
-        key = self.wired_key
+    def maintain_connected(self, wlan, credentials):
+        label = '有线' if self.last_action == 'wired' else '无线'
+        key = self.network_key
         if key is None:
-            self.update('检测到多条有线连接，请保留一条后重试')
+            self.update(label + '网络待命：等待唯一可用的 IPv4 连接')
             return
-        if not portal_routes_through(key[0]):
-            self.update('有线网络待命：校园认证路径尚未指向此网卡')
+        if not self.connection_matches(wlan):
+            self.update(label + '网络待命：校园认证路径未指向当前连接')
             return
         if self.portal_client is None:
             self.portal_client = Portal(source_ip=key[1])
-        if not self.wired_confirmed:
-            self.update('正在识别有线校园网')
-            if not self.portal_client.detect_wired_campus():
-                self.update('未发现有线校园网认证跳转，保持当前网络')
-                return
-            if wired_connections() != (key,) or not self.permitted():
-                return
-            self.wired_confirmed = True
-            logging.info('已识别有线校园网认证跳转')
-        self.next_status = time.monotonic() + 3
-        self.maintain(None, credentials)
+        try:
+            self.next_status = time.monotonic() + 3
+            self.maintain(wlan, credentials)
+        except CampusStatusUnavailable:
+            with self.lock:
+                if not self.permitted():
+                    return
+                self.campus_confirmed = False
+                self.record_auth(None)
+            self.next_status = time.monotonic() + 10
+            self.update(label + '网络：无法确认校园网（其他网络或认证服务暂不可用），稍后重试')
 
     def maintain(self, wlan, credentials):
         with self.lock:
@@ -771,10 +784,20 @@ class App:
         if portal is None:
             portal = self.portal_client = Portal()
         try:
-            online = portal.logged_in()
+            try:
+                online = portal.logged_in()
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
+                logging.info('校园网状态 API 无法确认：%s', type(exc).__name__)
+                raise CampusStatusUnavailable() from None
             with self.lock:
                 if not self.permitted() or request_epoch != self.network_epoch:
                     return
+                if self.last_action in ('wired', 'wireless'):
+                    if not self.connection_matches(wlan):
+                        return
+                    if not self.campus_confirmed:
+                        logging.info('校园网状态 API 已识别：%s', '已登录' if online else '未登录')
+                    self.campus_confirmed = True
                 self.record_auth(online)
                 request_epoch = self.network_epoch
                 if online:
@@ -827,10 +850,10 @@ class App:
     def probe_internet(self, epoch):
         try:
             with self.lock:
-                key = self.wired_key if self.last_action == 'wired' else None
+                key = self.network_key if self.last_action in ('wired', 'wireless') else None
             available = internet_available(key[1]) if key else internet_available()
             with self.lock:
-                if epoch == self.network_epoch and self.auth_state is True and self.permitted() and self.last_action in ('campus', 'wired'):
+                if epoch == self.network_epoch and self.auth_state is True and self.permitted() and self.last_action in ('campus', 'wired', 'wireless'):
                     self.probe_ok = available
                     self.update('校园网已登录，Internet 可用' if available else '校园网已登录，等待 Internet 恢复')
         finally:

@@ -39,6 +39,25 @@ class AuthenticationStateTests(unittest.TestCase):
         app.record_auth(True)
         self.assertEqual(app.next_login, 0)
 
+    def test_wired_start_already_online_confirms_internet_without_login(self):
+        app = self.app()
+        app.last_action = 'wired'
+        app.network_key = (7, '192.0.2.2', '192.0.2.1')
+        app.campus_confirmed = False
+        portal = app.portal_client = MagicMock()
+        portal.detect_wired_campus.return_value = False
+        portal.logged_in.return_value = True
+        with patch.object(guard, 'portal_routes_through', return_value=True), \
+             patch.object(guard, 'wired_connections', return_value=(app.network_key,)), \
+             patch.object(guard.threading, 'Thread'):
+            app.maintain_connected(None, {})
+        self.assertTrue(app.auth_state)
+        with patch.object(guard, 'internet_available', return_value=True) as probe:
+            app.probe_internet(app.network_epoch)
+        probe.assert_called_once_with('192.0.2.2')
+        self.assertEqual(app.status, '校园网已登录，Internet 可用')
+        portal.login.assert_not_called()
+
     def test_repeated_logout_can_login_without_previous_cooldown(self):
         app = self.app()
         portal = MagicMock()
