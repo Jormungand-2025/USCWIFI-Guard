@@ -6,9 +6,9 @@ Windows 托盘程序，用于自动连接 `USCWIFI`、完成无线或有线校�
 
 ## 下载与使用
 
-从 [Releases](https://github.com/Jormungand-2025/USCWIFI-Guard/releases/latest) 下载 `USCWIFI_Guard_v1.0.6.exe`。无需安装 Python。
+从 [Releases](https://github.com/Jormungand-2025/USCWIFI-Guard/releases/latest) 下载 `USCWIFI_Guard_v1.0.7.exe`。无需安装 Python。
 
-当前版本为 `v1.0.6`，构建号为 `20261020.5`。启动后窗口标题和主界面应显示 `v1.0.6`，主界面同时显示构建号。更新时请先从托盘退出旧进程，再运行新下载的程序。
+当前版本为 `v1.0.7`，构建号为 `20261103.3`。启动后窗口标题和主界面应显示 `v1.0.7`，主界面同时显示构建号。更新时请先从托盘退出旧进程，再运行新下载的程序。
 
 1. 先在 Windows 中手动连接一次 `USCWIFI`，确保系统已保存同名无线配置，并保持 Wi-Fi 开启。
 2. 将程序放到固定位置，双击运行，在本机窗口输入账号和密码。
@@ -28,6 +28,8 @@ Windows 托盘程序，用于自动连接 `USCWIFI`、完成无线或有线校�
 - 通过 Windows 原生接口实时判断实体有线连接，排除虚拟网卡和断开连接的旧地址；待命提示区分有线与其他 Wi-Fi。
 - 支持暂停、恢复、修改凭据、退出及当前用户登录后自动启动。
 - 登录拒绝、验证码、强制修改密码时停止自动认证并提醒。
+- 检测到校园认证仍在线但拨号为 `Peer Terminate`，且 Internet 连续不可用超过 10 秒时，自动注销并重新登录，单次连续故障最多尝试 10 次；Internet 恢复或网络切换后重置次数。
+- 窗口“退出校园网”按钮会先暂停维护，避免退出后立即自动登录。
 - 网络故障采用退避重试，避免连续提交密码。
 - 登录和确认在线复用网页会话；连续三次提交却未确认在线时停止重试，可通过“导出诊断”提供脱敏反馈。
 
@@ -57,7 +59,7 @@ python -m pip install -r requirements-dev.txt
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1
 ```
 
-生成文件：`dist/USCWIFI_Guard_v1.0.6.exe`。本地构建不需要校园网账号密码。
+生成文件：`dist/USCWIFI_Guard_v1.0.7.exe`。本地构建不需要校园网账号密码。
 
 ## 回归测试
 

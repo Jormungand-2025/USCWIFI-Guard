@@ -31,8 +31,8 @@ DATA = Path(os.environ['LOCALAPPDATA']) / 'USCWIFI维护助手'
 CONFIG = DATA / 'settings.json'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 APP_NAME = 'USCWIFIGuard'
-APP_VERSION = '1.0.6'
-BUILD_ID = '20261020.5'
+APP_VERSION = '1.0.7'
+BUILD_ID = '20261103.3'
 APP_TITLE = f'USCWIFI 维护助手 v{APP_VERSION}'
 CREATE_NO_WINDOW = 0x08000000
 
@@ -391,7 +391,8 @@ class Portal:
         result = json.loads(r.content.decode('utf-8-sig'))
         if not isinstance(result, dict):
             raise RuntimeError('认证接口返回格式无法识别')
-        if path in ('account/check', 'account/login') or (path == 'account/status' and result.get('code') != 0):
+        if (path in ('account/check', 'account/login', 'account/logout')
+                or (path == 'account/status' and (result.get('code') != 0 or result.get('dialCode') != 'ok:dialup'))):
             summary = response_summary(result)
             if path == 'account/login' and result.get('code') == 0:
                 online = result.get('online')
@@ -405,11 +406,22 @@ class Portal:
             logging.info('认证接口 %s：%s', path, json.dumps(summary, ensure_ascii=False))
         return result
 
-    def logged_in(self):
-        status = self.call('account/status')
-        if type(status.get('code')) is not int or status['code'] not in (0, 1):
+    def status(self):
+        result = self.call('account/status')
+        if type(result.get('code')) is not int or result['code'] not in (0, 1):
             raise RuntimeError('无法识别认证状态')
-        return status.get('code') == 0
+        return result
+
+    def logged_in(self):
+        return self.status().get('code') == 0
+
+    def logout(self):
+        result = self.call('account/logout')
+        code = result.get('code')
+        # The campus login page treats code=1 as logout failure.
+        if type(code) is not int or code == 1:
+            raise RuntimeError('校园网注销未确认')
+        return True
 
     def discover(self, redirect=False):
         # Load the page before CSRF/check/login, retaining its cookies like a browser.
@@ -482,6 +494,11 @@ class App:
         self.last_internet = 0
         self.probe_running = False
         self.probe_ok = None
+        self.internet_down_since = None
+        self.peer_recovery_attempts = 0
+        self.peer_recovery_in_progress = False
+        self.dial_code = None
+        self.logout_requested = False
         self.network_epoch = 0
         self.auth_state = None
         self.unconfirmed_logins = 0
@@ -541,6 +558,7 @@ class App:
         bottom = ttk.Frame(f)
         bottom.pack(fill='x', pady=10)
         ttk.Button(bottom, text='导出诊断', command=self.export_diagnostics).pack(side='left')
+        ttk.Button(bottom, text='退出校园网', command=self.request_logout).pack(side='left', padx=8)
         ttk.Button(bottom, text='退出程序', command=self.quit).pack(side='right')
         self.root.protocol('WM_DELETE_WINDOW', self.root.withdraw)
 
@@ -571,6 +589,9 @@ class App:
             self.network_epoch += 1
             self.probe_ok = None
             self.last_internet = 0
+            self.internet_down_since = None
+            self.peer_recovery_attempts = 0
+            self.peer_recovery_in_progress = False
         self.password.set('')
         self.pause_text.set('暂停维护')
         self.update('配置已保存，开始维护')
@@ -584,6 +605,8 @@ class App:
             self.auth_state = None
             self.probe_ok = None
             self.last_internet = 0
+            self.internet_down_since = None
+            self.peer_recovery_attempts = 0
             if not self.settings['paused']:
                 self.settings['blocked'] = ''
                 self.next_login, self.failures = 0, 0
@@ -672,7 +695,10 @@ class App:
                 try:
                     with self.lock:
                         settings, credentials = dict(self.settings), dict(self.credentials or {})
-                    if settings.get('paused'):
+                        logout_requested = self.logout_requested
+                    if logout_requested:
+                        self.perform_logout(wlan)
+                    elif settings.get('paused'):
                         self.update('维护已暂停')
                     elif settings.get('blocked'):
                         self.update(settings['blocked'] + '；自动登录已停止')
@@ -705,6 +731,10 @@ class App:
                             self.next_status = self.next_login = 0
                             self.last_internet = 0
                             self.probe_ok = None
+                            self.internet_down_since = None
+                            self.peer_recovery_attempts = 0
+                            self.peer_recovery_in_progress = False
+                            self.dial_code = None
                             self.network_epoch += 1
                             self.auth_state = None
                             self.last_action = action
@@ -785,7 +815,8 @@ class App:
             portal = self.portal_client = Portal()
         try:
             try:
-                online = portal.logged_in()
+                auth_status = portal.status()
+                online = auth_status.get('code') == 0
             except (requests.RequestException, ValueError, RuntimeError) as exc:
                 logging.info('校园网状态 API 无法确认：%s', type(exc).__name__)
                 raise CampusStatusUnavailable() from None
@@ -798,12 +829,16 @@ class App:
                     if not self.campus_confirmed:
                         logging.info('校园网状态 API 已识别：%s', '已登录' if online else '未登录')
                     self.campus_confirmed = True
+                self.dial_code = auth_status.get('dialCode') if online else None
                 self.record_auth(online)
                 request_epoch = self.network_epoch
                 if online:
                     self.failures = 0
+                    peer_terminated = str(self.dial_code or '').strip().casefold() == 'peer terminate'
                     if self.probe_ok is True:
                         self.update('校园网已登录，Internet 可用')
+                    elif self.probe_ok is False and peer_terminated:
+                        self.update('校园网已登录，拨号 Peer Terminate，等待 Internet 恢复')
                     elif self.probe_ok is False:
                         self.update('校园网已登录，等待 Internet 恢复')
                     else:
@@ -812,14 +847,30 @@ class App:
                     if not self.probe_running and time.monotonic() - self.last_internet >= interval:
                         self.probe_running = True
                         self.last_internet = time.monotonic()
-                        threading.Thread(target=self.probe_internet, args=(self.network_epoch,), daemon=True).start()
-                    return
-                if time.monotonic() < self.next_login:
-                    self.update('认证接口暂未确认在线，稍后再次查询')
-                    return
-                if self.unconfirmed_logins >= 3:
-                    raise ManualRequired('连续提交认证后，服务器仍未确认本机在线；请导出诊断，或打开网页手动处理')
-                self.update('正在进行校园网认证')
+                        threading.Thread(target=self.probe_internet, args=(self.network_epoch, self.last_internet), daemon=True).start()
+                    should_recover_peer = (
+                        peer_terminated and self.probe_ok is False and self.internet_down_since is not None
+                        and time.monotonic() - self.internet_down_since >= 10
+                        and self.peer_recovery_attempts < 10 and not self.peer_recovery_in_progress
+                    )
+                    if should_recover_peer:
+                        self.peer_recovery_attempts += 1
+                        self.peer_recovery_in_progress = True
+                        self.update(f'Peer Terminate 恢复尝试 {self.peer_recovery_attempts}/10，正在注销并重新登录')
+                        logging.info('Peer Terminate 自动恢复尝试 %s/10', self.peer_recovery_attempts)
+                else:
+                    should_recover_peer = False
+                if not online:
+                    if time.monotonic() < self.next_login:
+                        self.update('认证接口暂未确认在线，稍后再次查询')
+                        return
+                    if self.unconfirmed_logins >= 3:
+                        raise ManualRequired('连续提交认证后，服务器仍未确认本机在线；请导出诊断，或打开网页手动处理')
+                    self.update('正在进行校园网认证')
+            if online:
+                if should_recover_peer:
+                    self.recover_peer_terminated(wlan, credentials, portal, request_epoch)
+                return
             if portal.login(credentials, lambda: self.safe_to_submit(wlan, credentials)):
                 with self.lock:
                     if self.permitted() and request_epoch == self.network_epoch:
@@ -840,6 +891,9 @@ class App:
             self.network_epoch += 1
             self.probe_ok = None
             self.last_internet = 0
+            self.internet_down_since = None
+            self.peer_recovery_in_progress = False
+            self.dial_code = None if not online else self.dial_code
             self.auth_state = online
         if online or previous is True:
             self.next_login = 0
@@ -847,7 +901,9 @@ class App:
             self.failures = 0
             self.unconfirmed_logins = 0
 
-    def probe_internet(self, epoch):
+    def probe_internet(self, epoch, started_at=None):
+        if started_at is None:
+            started_at = time.monotonic()
         try:
             with self.lock:
                 key = self.network_key if self.last_action in ('wired', 'wireless') else None
@@ -855,9 +911,99 @@ class App:
             with self.lock:
                 if epoch == self.network_epoch and self.auth_state is True and self.permitted() and self.last_action in ('campus', 'wired', 'wireless'):
                     self.probe_ok = available
+                    if available:
+                        if self.internet_down_since is not None:
+                            logging.info('Internet 探测恢复，重置 Peer Terminate 恢复状态')
+                        self.internet_down_since = None
+                        self.peer_recovery_attempts = 0
+                    elif self.internet_down_since is None:
+                        # Start the outage clock when this failed probe began, not when its timeouts ended.
+                        self.internet_down_since = started_at
+                        logging.info('Internet 探测失败，开始 Peer Terminate 恢复计时')
                     self.update('校园网已登录，Internet 可用' if available else '校园网已登录，等待 Internet 恢复')
+                    if (not available and self.dial_code and self.dial_code.strip().casefold() == 'peer terminate'
+                            and self.internet_down_since is not None
+                            and time.monotonic() - self.internet_down_since >= 10
+                            and self.peer_recovery_attempts < 10):
+                        self.next_status = 0
+                        self.wake.set()
+                    elif (not available and self.dial_code and self.dial_code.strip().casefold() == 'peer terminate'
+                            and self.peer_recovery_attempts >= 10):
+                        self.update('Peer Terminate 自动恢复已尝试 10 次；Internet 恢复或网络切换后将重新计数')
         finally:
             self.probe_running = False
+
+    def recover_peer_terminated(self, wlan, credentials, portal, request_epoch):
+        try:
+            if (not self.permitted() or request_epoch != self.network_epoch
+                    or not self.connection_matches(wlan)):
+                return
+            logging.info('拨号 Peer Terminate 且 Internet 不可用超过 10 秒：开始注销重登')
+            if not portal.logout():
+                raise RuntimeError('校园网注销未确认')
+            if not self.safe_to_submit(wlan, credentials):
+                return
+            if not portal.login(credentials, lambda: self.safe_to_submit(wlan, credentials)):
+                return
+            with self.lock:
+                if self.permitted() and request_epoch == self.network_epoch:
+                    self.next_login = time.monotonic() + 8
+                    self.next_status = time.monotonic() + 0.5
+                    self.last_internet = 0
+                    self.update('Peer Terminate 已注销并重新登录，正在确认 Internet')
+        finally:
+            with self.lock:
+                self.peer_recovery_in_progress = False
+
+    def request_logout(self):
+        if not messagebox.askyesno(
+                APP_TITLE, '退出校园网会暂停自动维护，避免程序立即重新登录。要继续吗？', parent=self.root):
+            return
+        with self.lock:
+            self.settings['paused'] = True
+            self.logout_requested = True
+            self.network_epoch += 1
+            self.auth_state = None
+            self.probe_ok = None
+            self.internet_down_since = None
+            self.peer_recovery_in_progress = False
+            self.next_status = 0
+            try:
+                write_settings(self.settings, self.credentials)
+            except Exception:
+                messagebox.showerror(APP_TITLE, '暂停维护状态保存失败，未执行退出登录。', parent=self.root)
+                self.logout_requested = False
+                self.settings['paused'] = False
+                return
+        self.pause_text.set('恢复维护')
+        self.update('正在退出校园网并暂停维护')
+        self.wake.set()
+
+    def perform_logout(self, wlan):
+        with self.lock:
+            self.logout_requested = False
+            key = self.network_key
+            portal = self.portal_client
+        if key is None or not portal_routes_through(key[0]):
+            self.update('维护已暂停；当前没有可用的校园网认证路径，退出登录未确认')
+            return
+        temporary = portal is None
+        if temporary:
+            portal = Portal(source_ip=key[1])
+        try:
+            if self.last_action in ('wired', 'wireless') and not self.connection_matches(wlan):
+                self.update('维护已暂停；校园网认证路径已变化，退出登录未确认')
+                return
+            portal.logout()
+            logging.info('校园网主动退出登录完成')
+            self.update('已退出校园网，自动维护已暂停')
+        except Exception as exc:
+            logging.info('校园网主动退出登录失败：%s', type(exc).__name__)
+            self.update('维护已暂停，但校园网退出登录未确认；可打开登录页手动退出')
+        finally:
+            if temporary:
+                portal.close()
+
 
     def pump(self):
         try:
